@@ -1,0 +1,919 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<title>Canyon Clash Plan</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;color:#1a1a1a;padding:28px;max-width:940px}
+
+.edit-bar{display:flex;justify-content:space-between;align-items:center;background:#EFF6FF;border:0.5px solid #93C5FD;border-radius:8px;padding:9px 14px;margin-bottom:20px;gap:12px}
+.edit-bar-text{font-size:11px;color:#1D4ED8;line-height:1.5}
+.edit-bar-text b{font-weight:700}
+.ss-btn{font-size:11px;font-weight:700;background:#1D4ED8;color:#fff;border:none;border-radius:6px;padding:6px 14px;cursor:pointer;white-space:nowrap;display:inline-block;margin-bottom:16px}
+.ss-btn:hover{background:#1E3A8A}
+body.screenshot .ss-btn{position:fixed;bottom:16px;right:16px;margin:0;opacity:0.75;z-index:9999}
+.export-btn{font-size:11px;font-weight:700;background:#15803D;color:#fff;border:none;border-radius:6px;padding:6px 14px;cursor:pointer;white-space:nowrap;display:inline-block;margin-bottom:16px;margin-left:8px}
+.export-btn:hover{background:#14532D}
+body.screenshot .edit-only{display:none!important}
+body.screenshot .edit-bar{display:none!important}
+
+/* All contenteditable text */
+[contenteditable]{outline:none;cursor:text}
+[contenteditable]:focus{background:rgba(29,78,216,0.05);border-radius:3px}
+[contenteditable][data-ph]:empty:before{content:attr(data-ph);opacity:0.3;pointer-events:none}
+
+/* Slot name fields */
+.slot-name{display:inline-block;min-width:80px;border-bottom:1px dashed rgba(0,0,0,0.18);padding:0 2px}
+.slot-name:focus{background:rgba(255,255,255,0.5);border-radius:3px;border-bottom-style:solid;border-bottom-color:rgba(0,0,0,0.4)}
+.slot-name[data-ph]:empty:before{content:attr(data-ph);opacity:0.28;pointer-events:none}
+
+/* Layout */
+.header{display:flex;justify-content:space-between;align-items:flex-end;padding-bottom:16px;margin-bottom:20px;border-bottom:1px solid #e0e0e0}
+.eyebrow{font-size:10px;font-weight:700;color:#888;letter-spacing:.1em;margin-bottom:6px}
+.page-title{font-size:30px;font-weight:700;margin-bottom:4px}
+.subtitle{font-size:13px;color:#666}
+.stat-block{display:flex;gap:24px;text-align:center;flex-shrink:0}
+.stat-label{font-size:10px;color:#888;margin-bottom:2px}
+.stat-value{font-size:26px;font-weight:700}
+.section{margin-bottom:20px}
+.section-label{font-size:10px;font-weight:700;color:#888;letter-spacing:.09em;margin-bottom:8px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.g2r{display:grid;grid-template-columns:1fr 1fr;gap:0 20px}
+.card{border-radius:8px;padding:10px 12px}
+.card-lg{border-radius:12px;overflow:hidden}
+
+/* ── POINT CARDS ── */
+.pr{background:#FEF2F2;border-left:3px solid #B91C1C}
+.pr .ct{font-size:10px;font-weight:700;color:#B91C1C;margin-bottom:2px;display:block}
+.pr .cv{font-size:15px;font-weight:700;color:#7F1D1D;display:block}
+.pr .cs{font-size:10px;color:#B91C1C;margin-top:2px;display:block}
+.pg{background:#F0FDF4;border-left:3px solid #15803D}
+.pg .ct{font-size:10px;font-weight:700;color:#15803D;margin-bottom:2px;display:block}
+.pg .cv{font-size:15px;font-weight:700;color:#14532D;display:block}
+.pg .cs{font-size:10px;color:#15803D;margin-top:2px;display:block}
+.pa{background:#FFFBEB;border-left:3px solid #D97706}
+.pa .ct{font-size:10px;font-weight:700;color:#D97706;margin-bottom:2px;display:block}
+.pa .cv{font-size:15px;font-weight:700;color:#78350F;display:block}
+.pa .cs{font-size:10px;color:#D97706;margin-top:2px;display:block}
+.pn{background:#F9FAFB}
+.pn .ct{font-size:10px;font-weight:700;color:#6B7280;margin-bottom:2px;display:block}
+.pn .cv{font-size:14px;font-weight:700;color:#111827;display:block}
+
+/* ── PHASE CARDS ── */
+.ph-g{background:#F3F4F6}
+.ph-g .pn2{font-size:10px;color:#6B7280;font-weight:700;margin-bottom:4px;display:block}
+.ph-g .pname{font-size:13px;font-weight:700;color:#111827;margin-bottom:3px;display:block}
+.ph-g .pdesc{font-size:11px;color:#6B7280;line-height:1.4;display:block}
+.ph-b{background:#EFF6FF}
+.ph-b .pn2{font-size:10px;color:#1D4ED8;font-weight:700;margin-bottom:4px;display:block}
+.ph-b .pname{font-size:13px;font-weight:700;color:#1E3A8A;margin-bottom:3px;display:block}
+.ph-b .pdesc{font-size:11px;color:#1D4ED8;line-height:1.4;display:block}
+.ph-a{background:#FFFBEB}
+.ph-a .pn2{font-size:10px;color:#D97706;font-weight:700;margin-bottom:4px;display:block}
+.ph-a .pname{font-size:13px;font-weight:700;color:#78350F;margin-bottom:3px;display:block}
+.ph-a .pdesc{font-size:11px;color:#D97706;line-height:1.4;display:block}
+.ph-r{background:#FEF2F2;border:0.5px solid #FECACA}
+.ph-r .pn2{font-size:10px;color:#B91C1C;font-weight:700;margin-bottom:4px;display:block}
+.ph-r .pname{font-size:13px;font-weight:700;color:#7F1D1D;margin-bottom:3px;display:block}
+.ph-r .pdesc{font-size:11px;color:#B91C1C;line-height:1.4;display:block}
+
+/* ── LANE THEMES ── */
+.l-header{padding:10px 14px}
+.l-header .ln{font-size:12px;font-weight:700;display:block}
+.l-header .ls{font-size:10px;margin-top:2px;display:block}
+.l-body{padding:8px 13px;border:0.5px solid;border-top:none}
+.l-slot{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:0.5px solid;font-size:12px}
+.l-slot.last{border-bottom:none!important}
+.slot-right{display:flex;align-items:center;gap:4px;flex-shrink:0}
+
+/* Yellow – Stormrage */
+.ty .l-header{background:#B45309}
+.ty .l-header .ln{color:#FEF3C7}
+.ty .l-header .ls{color:#FCD34D}
+.ty .l-body{background:#FFFBEB;border-color:#FCD34D}
+.ty .l-slot{border-bottom-color:#FDE68A;color:#78350F}
+/* Red – Flameguard */
+.tr .l-header{background:#991B1B}
+.tr .l-header .ln{color:#FEF2F2}
+.tr .l-header .ls{color:#FCA5A5}
+.tr .l-body{background:#FEF2F2;border-color:#FECACA}
+.tr .l-slot{border-bottom-color:#FECACA;color:#7F1D1D}
+/* Purple – Iceguard */
+.tp .l-header{background:#4C1D95}
+.tp .l-header .ln{color:#F5F3FF}
+.tp .l-header .ls{color:#A78BFA}
+.tp .l-body{background:#F5F3FF;border-color:#A78BFA}
+.tp .l-slot{border-bottom-color:#C4B5FD;color:#2E1065}
+
+/* Grey – Neutral */
+.tg .l-header{background:#4B5563}
+.tg .l-header .ln{color:#F9FAFB}
+.tg .l-header .ls{color:#D1D5DB}
+.tg .l-body{background:#F9FAFB;border-color:#D1D5DB}
+.tg .l-slot{border-bottom-color:#E5E7EB;color:#1F2937}
+/* Theme switcher dots */
+.theme-row{display:flex;gap:5px;margin-top:7px}
+.t-dot{width:13px;height:13px;border-radius:50%;border:1.5px solid rgba(255,255,255,0.3);cursor:pointer;padding:0;transition:transform .1s,border-color .1s}
+.t-dot:hover{border-color:rgba(255,255,255,0.7);transform:scale(1.1)}
+.t-dot.on{border:2px solid #fff;transform:scale(1.25)}
+.td-y{background:#F59E0B}
+.td-r{background:#EF4444}
+.td-p{background:#7C3AED}
+.td-g{background:#6B7280}
+
+/* Badges */
+.bc{font-size:9px;font-weight:700;background:#B91C1C;color:#FEF2F2;padding:2px 6px;border-radius:4px;white-space:nowrap}
+.bf{font-size:9px;font-weight:700;background:#15803D;color:#F0FDF4;padding:2px 6px;border-radius:4px;white-space:nowrap}
+.rm-btn{border:none;background:none;color:#ccc;cursor:pointer;font-size:15px;line-height:1;padding:0 2px}
+.rm-btn:hover{color:#EF4444}
+.add-row{padding:7px 0 2px;text-align:center}
+.add-btn{font-size:10px;font-weight:700;color:#6B7280;background:#F3F4F6;border:0.5px solid #D1D5DB;border-radius:5px;padding:5px 12px;cursor:pointer}
+.add-btn:hover{background:#E5E7EB}
+
+/* Special boxes */
+.sb-r{border-radius:12px;border:0.5px solid #FECACA;overflow:hidden}
+.sh-r{background:#B91C1C;padding:10px 14px}
+.sbody-r{background:#FEF2F2;padding:10px 14px}
+.sb-g{border-radius:12px;border:0.5px solid #86EFAC;overflow:hidden}
+.sh-g{background:#15803D;padding:10px 14px}
+.sbody-g{background:#F0FDF4;padding:10px 14px}
+.bxt{font-size:12px;font-weight:700;display:block}
+.bxs{font-size:10px;margin-top:2px;display:block}
+.sh-r .bxt{color:#FEF2F2}.sh-r .bxs{color:#FCA5A5}
+.sh-g .bxt{color:#F0FDF4}.sh-g .bxs{color:#86EFAC}
+.bxsl{font-size:11px;line-height:2;display:block}
+.sbody-r .bxsl{color:#7F1D1D}
+.sbody-g .bxsl{color:#14532D}
+.bxnote{margin-top:8px;font-size:10px;color:#B91C1C;line-height:1.4;border-top:0.5px solid #FECACA;padding-top:8px;display:block}
+
+.fuel{border-radius:8px;background:#F9FAFB;padding:10px 13px;border:0.5px solid #E5E7EB;margin-top:8px}
+.fuel .ft{font-size:10px;font-weight:700;color:#6B7280;margin-bottom:4px;display:block}
+.fuel .fd{font-size:11px;color:#6B7280;line-height:1.4;display:block}
+.rules-box{border-radius:12px;border:0.5px solid #E5E7EB;overflow:hidden}
+.rules-hdr{background:#F3F4F6;padding:9px 14px;border-bottom:0.5px solid #E5E7EB;font-size:12px;font-weight:700;color:#111827}
+.rules-body{padding:10px 14px}
+.rule{font-size:11px;color:#6B7280;line-height:1.4;padding:5px 0;border-bottom:0.5px solid #F3F4F6;display:block}
+.rule:last-child{border-bottom:none}
+.rule.alert{color:#B91C1C}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="edit-bar edit-only">
+  <div class="edit-bar-text">
+    <b>Edit mode:</b> Click any text to edit it — names, notes, rules, values, everything.
+    Use the <b>colored dots</b> on each lane to switch between Stormrage (yellow), Flameguard (red), and Iceguard (purple).
+    Use <b>+</b> / <b>×</b> to add or remove players.
+  </div>
+</div>
+<button class="ss-btn" id="ss-btn" onclick="toggleSS()">Hide Controls for Screenshot</button>
+<button class="export-btn edit-only" onclick="exportPlan()">Export Filled Plan</button>
+
+<!-- HEADER -->
+<div class="header">
+  <div>
+    <div class="eyebrow">
+      STATE <span contenteditable="true" data-ph="###" style="min-width:35px;display:inline-block"></span>
+      &nbsp;·&nbsp;
+      <span contenteditable="true" data-ph="ALLIANCE NAME" style="min-width:120px;display:inline-block"></span>
+    </div>
+    <div class="page-title">Canyon Clash</div>
+    <div class="subtitle">
+      Legion <span contenteditable="true" data-ph="1" style="min-width:18px;display:inline-block"></span>
+      &nbsp;·&nbsp;
+      <span contenteditable="true" data-ph="Date" style="min-width:80px;display:inline-block"></span>
+      &nbsp;·&nbsp;
+      <span contenteditable="true" data-ph="Time UTC" style="min-width:80px;display:inline-block"></span>
+    </div>
+  </div>
+  <div class="stat-block">
+    <div><div class="stat-label">Players</div><div class="stat-value" id="total-p">26</div></div>
+    <div><div class="stat-label">Total Marches</div><div class="stat-value" id="total-m">78</div></div>
+  </div>
+</div>
+
+<!-- BUILDING POINTS -->
+<div class="section">
+  <div class="section-label" contenteditable="true">BUILDING POINTS</div>
+  <div class="g3">
+    <div class="card pr">
+      <span class="ct" contenteditable="true">CITADEL (CENTER)</span>
+      <span class="cv" contenteditable="true">1,800/min</span>
+      <span class="cs" contenteditable="true">+ 50,000 pts at battle end</span>
+    </div>
+    <div class="card pg">
+      <span class="ct" contenteditable="true">BASTION / FORTRESS</span>
+      <span class="cv" contenteditable="true">1,800/min</span>
+      <span class="cs" contenteditable="true">Protect at all costs</span>
+    </div>
+    <div class="card pa">
+      <span class="ct" contenteditable="true">CLUSTER OF RUINS x5</span>
+      <span class="cv" contenteditable="true">600/min</span>
+      <span class="cs" contenteditable="true">Primary passive target</span>
+    </div>
+    <div class="card pn">
+      <span class="ct" contenteditable="true">RUINS x9</span>
+      <span class="cv" contenteditable="true">180/min</span>
+    </div>
+    <div class="card pn">
+      <span class="ct" contenteditable="true">STRONGHOLD x9</span>
+      <span class="cv" contenteditable="true">60/min</span>
+    </div>
+    <div class="card pn">
+      <span class="ct" contenteditable="true">AIRPORTS x6</span>
+      <span class="cv" contenteditable="true">60/min</span>
+    </div>
+  </div>
+</div>
+
+<!-- PHASES -->
+<div class="section">
+  <div class="section-label" contenteditable="true">PHASES</div>
+  <div class="g4">
+    <div class="card ph-g">
+      <span class="pn2" contenteditable="true">PHASE 1 · 3 MIN</span>
+      <span class="pname" contenteditable="true">Prep</span>
+      <span class="pdesc" contenteditable="true">Voice chat. Assign guardians. Ready your marches.</span>
+    </div>
+    <div class="card ph-b">
+      <span class="pn2" contenteditable="true">PHASE 2 · 17 MIN</span>
+      <span class="pname" contenteditable="true">Invasion</span>
+      <span class="pdesc" contenteditable="true">Rush neutrals. Secure airports. Lock in ruin clusters.</span>
+    </div>
+    <div class="card ph-a">
+      <span class="pn2" contenteditable="true">PHASE 3 · 20 MIN</span>
+      <span class="pname" contenteditable="true">Fortress</span>
+      <span class="pdesc" contenteditable="true">Hold high-value buildings. Block enemy routes to center.</span>
+    </div>
+    <div class="card ph-r">
+      <span class="pn2" contenteditable="true">PHASE 4 · 20 MIN (!)</span>
+      <span class="pname" contenteditable="true">Citadel Onslaught</span>
+      <span class="pdesc" contenteditable="true">Everyone Speed at least 1 march to middle and hold till end of battle</span>
+    </div>
+  </div>
+</div>
+
+<!-- LANE ASSIGNMENTS -->
+<div class="section">
+  <div class="section-label" contenteditable="true">LANE ASSIGNMENTS</div>
+  <div class="g3" id="lanes-grid"><div id="col-left"><div class="card-lg ty">
+    <div class="l-header">
+      <span class="ln" contenteditable="true" data-ph="Lane name" onblur="lane('left').label=this.textContent.trim()||lane('left').label">LEFT LANE</span>
+      <span class="ls" id="sub-left">Yellow · 9 players</span>
+      <div class="theme-row edit-only"><button class="t-dot td-y on edit-only" onclick="setTheme('left','ty')" title="Stormrage"></button><button class="t-dot td-r edit-only" onclick="setTheme('left','tr')" title="Flameguard"></button><button class="t-dot td-p edit-only" onclick="setTheme('left','tp')" title="Iceguard"></button><button class="t-dot td-g edit-only" onclick="setTheme('left','tg')" title="Neutral"></button></div>
+    </div>
+    <div class="l-body" id="body-left">
+      <div class="l-slot">
+      <span>1. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[0]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',0)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>2. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[1]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',1)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>3. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[2]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',2)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>4. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[3]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',3)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>5. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[4]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',4)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>6. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[5]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',5)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>7. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[6]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',6)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>8. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[7]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',7)" title="Remove">×</button></span>
+    </div><div class="l-slot last">
+      <span>9. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('left').players[8]=this.textContent.trim();syncRoles('left')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('left',8)" title="Remove">×</button></span>
+    </div>
+      <div class="add-row edit-only">
+        <button class="add-btn" onclick="addPlayer('left')">+ Add Player</button>
+      </div>
+    </div>
+  </div></div><div id="col-center"><div class="card-lg tr">
+    <div class="l-header">
+      <span class="ln" contenteditable="true" data-ph="Lane name" onblur="lane('center').label=this.textContent.trim()||lane('center').label">CENTER LANE</span>
+      <span class="ls" id="sub-center">Red · 9 players</span>
+      <div class="theme-row edit-only"><button class="t-dot td-y edit-only" onclick="setTheme('center','ty')" title="Stormrage"></button><button class="t-dot td-r on edit-only" onclick="setTheme('center','tr')" title="Flameguard"></button><button class="t-dot td-p edit-only" onclick="setTheme('center','tp')" title="Iceguard"></button><button class="t-dot td-g edit-only" onclick="setTheme('center','tg')" title="Neutral"></button></div>
+    </div>
+    <div class="l-body" id="body-center">
+      <div class="l-slot">
+      <span>1. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[0]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',0)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>2. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[1]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',1)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>3. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[2]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',2)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>4. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[3]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',3)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>5. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[4]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',4)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>6. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[5]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',5)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>7. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[6]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',6)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>8. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[7]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',7)" title="Remove">×</button></span>
+    </div><div class="l-slot last">
+      <span>9. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('center').players[8]=this.textContent.trim();syncRoles('center')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('center',8)" title="Remove">×</button></span>
+    </div>
+      <div class="add-row edit-only">
+        <button class="add-btn" onclick="addPlayer('center')">+ Add Player</button>
+      </div>
+    </div>
+  </div></div><div id="col-bottom"><div class="card-lg tp">
+    <div class="l-header">
+      <span class="ln" contenteditable="true" data-ph="Lane name" onblur="lane('bottom').label=this.textContent.trim()||lane('bottom').label">BOTTOM LANE</span>
+      <span class="ls" id="sub-bottom">Purple · 8 players</span>
+      <div class="theme-row edit-only"><button class="t-dot td-y edit-only" onclick="setTheme('bottom','ty')" title="Stormrage"></button><button class="t-dot td-r edit-only" onclick="setTheme('bottom','tr')" title="Flameguard"></button><button class="t-dot td-p on edit-only" onclick="setTheme('bottom','tp')" title="Iceguard"></button><button class="t-dot td-g edit-only" onclick="setTheme('bottom','tg')" title="Neutral"></button></div>
+    </div>
+    <div class="l-body" id="body-bottom">
+      <div class="l-slot">
+      <span>1. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[0]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',0)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>2. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[1]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',1)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>3. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[2]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',2)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>4. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[3]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',3)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>5. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[4]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',4)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>6. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[5]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',5)" title="Remove">×</button></span>
+    </div><div class="l-slot">
+      <span>7. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[6]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',6)" title="Remove">×</button></span>
+    </div><div class="l-slot last">
+      <span>8. <span class="slot-name" contenteditable="true" data-pname="" data-ph="Player name" oninput="lane('bottom').players[7]=this.textContent.trim();syncRoles('bottom')"></span></span>
+      <span class="slot-right"><button class="rm-btn edit-only" onclick="removePlayer('bottom',7)" title="Remove">×</button></span>
+    </div>
+      <div class="add-row edit-only">
+        <button class="add-btn" onclick="addPlayer('bottom')">+ Add Player</button>
+      </div>
+    </div>
+  </div></div></div>
+</div>
+
+<!-- FUEL NOTE -->
+<div class="section">
+  <div class="fuel">
+    <span class="ft" contenteditable="true">FUEL / GUARDIAN MANAGEMENT</span>
+    <span class="fd" contenteditable="true">Managed by R4s.</span>
+  </div>
+</div>
+
+<!-- RULES -->
+<div class="rules-box">
+  <div class="rules-hdr" contenteditable="true">Key Rules</div>
+  <div class="rules-body">
+    <div class="g2r" id="rules-grid">
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="0" oninput="RULES[0].html=this.innerHTML"><b>Voice:</b> Join Discord VC before battle starts. Stay on for callouts.</span>
+      <button class="rm-btn edit-only" onclick="removeRule(0)" title="Remove rule">×</button>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="1" oninput="RULES[1].html=this.innerHTML"><strong data-start="129" data-end="145">Center push:</strong> If center is secured or not, push through/around it into enemy territory to keep pressure and block their path.</span>
+      <button class="rm-btn edit-only" onclick="removeRule(1)" title="Remove rule">×</button>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="2" oninput="RULES[2].html=this.innerHTML"><b>Fuel:</b> Don't waste on zeroing urself.</span>
+      <button class="rm-btn edit-only" onclick="removeRule(2)" title="Remove rule">×</button>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="3" oninput="RULES[3].html=this.innerHTML">If center is secured, don't advance deep in enemy territory. We will need to defend our side.</span>
+      <button class="rm-btn edit-only" onclick="removeRule(3)" title="Remove rule">×</button>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="4" oninput="RULES[4].html=this.innerHTML"><b>March limit:</b> 5–7 per building. Enough to recall and heal, Or advance ahead.&nbsp;<br></span>
+      <button class="rm-btn edit-only" onclick="removeRule(4)" title="Remove rule">×</button>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule alert" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="5" oninput="RULES[5].html=this.innerHTML"><b>Final:</b>We need to hold middle for the 50k end bonus.</span>
+      <button class="rm-btn edit-only" onclick="removeRule(5)" title="Remove rule">×</button>
+    </div>
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule" style="flex:1;border-bottom:none;padding:0" contenteditable="true" data-ridx="6" oninput="RULES[6].html=this.innerHTML"><b>Center lane: </b>Will also help either Left or right lane if they need help.</span>
+      <button class="rm-btn edit-only" onclick="removeRule(6)" title="Remove rule">×</button>
+    </div></div>
+    <div class="add-row edit-only" style="padding-top:8px;">
+      <button class="add-btn" onclick="addRule()">+ Add Rule</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const LANES = [ /*__LANES_START__*/
+  { id:"left", theme:"ty", label:"LEFT LANE", players:["","","","","","","","",""] },
+  { id:"center", theme:"tr", label:"CENTER LANE", players:["","","","","","","","",""] },
+  { id:"bottom", theme:"tp", label:"BOTTOM LANE", players:["","","","","","","",""] }
+];
+
+let RULES = [ /*__RULES_START__*/
+  { html:"<b>Voice:</b> Join Discord VC before battle starts. Stay on for callouts.", alert:false },
+  { html:"<strong data-start=\"129\" data-end=\"145\">Center push:</strong> If center is secured or not, push through/around it into enemy territory to keep pressure and block their path.", alert:false },
+  { html:"<b>Fuel:</b> Don't waste on zeroing urself.", alert:false },
+  { html:"If center is secured, don't advance deep in enemy territory. We will need to defend our side.", alert:false },
+  { html:"<b>March limit:</b> 5–7 per building. Enough to recall and heal, Or advance ahead.&nbsp;<br>", alert:false },
+  { html:"<b>Final:</b>We need to hold middle for the 50k end bonus.", alert:true },
+  { html:"<b>Center lane: </b>Will also help either Left or right lane if they need help.", alert:false }
+]; /*__RULES_END__*/
+
+const THEMES = {
+  ty:{ name:'Stormrage', sub:'Yellow' },
+  tr:{ name:'Flameguard', sub:'Red' },
+  tp:{ name:'Iceguard',   sub:'Purple' },
+  tg:{ name:'Neutral',    sub:'Grey' }
+};
+
+const THEME_KEYS = ['ty','tr','tp','tg'];
+const DOT_CLS = { ty:'td-y', tr:'td-r', tp:'td-p', tg:'td-g' };
+
+function lane(id){ return LANES.find(l=>l.id===id); }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function updateTotals(){
+  const t=LANES.reduce((s,l)=>s+l.players.length,0);
+  document.getElementById('total-p').textContent=t;
+  document.getElementById('total-m').textContent=t*3;
+}
+
+function syncRoles(id){
+  const l=lane(id);
+  const c=document.getElementById('cit-'+id);
+  const f=document.getElementById('fort-'+id);
+  if(c&&document.activeElement!==c) c.textContent=l.players[0]||'';
+  if(f&&document.activeElement!==f) f.textContent=l.players[1]||'';
+}
+
+function saveState(id){
+  const col=document.getElementById('col-'+id);
+  if(!col)return;
+  const nameEl=col.querySelector('.ln');
+  if(nameEl) lane(id).label=nameEl.textContent.trim()||lane(id).label;
+  col.querySelectorAll('[data-pname]').forEach((el,i)=>{ lane(id).players[i]=el.textContent.trim(); });
+}
+
+function setTheme(id,theme){
+  saveState(id);
+  lane(id).theme=theme;
+  renderLane(id);
+  syncRoles(id);
+}
+
+function renderLane(id){
+  const l=lane(id);
+  const grid=document.getElementById('lanes-grid');
+  let col=document.getElementById('col-'+id);
+  if(!col){ col=document.createElement('div'); col.id='col-'+id; grid.appendChild(col); }
+
+  const themeInfo=THEMES[l.theme];
+  const playerCount=l.players.length;
+  const sub=`${themeInfo.sub} · ${playerCount} player${playerCount!==1?'s':''}`;
+
+  const dots=THEME_KEYS.map(tk=>`<button class="t-dot ${DOT_CLS[tk]}${l.theme===tk?' on':''} edit-only" onclick="setTheme('${id}','${tk}')" title="${THEMES[tk].name}"></button>`).join('');
+
+  const slots=l.players.map((name,i)=>{
+    const isLast=i===l.players.length-1;
+    const badge='';
+    const rm=`<button class="rm-btn edit-only" onclick="removePlayer('${id}',${i})" title="Remove">×</button>`;
+    return `<div class="l-slot${isLast?' last':''}">
+      <span>${i+1}. <span class="slot-name" contenteditable="true" data-pname data-ph="Player name"
+        oninput="lane('${id}').players[${i}]=this.textContent.trim();syncRoles('${id}')">${esc(name)}</span></span>
+      <span class="slot-right">${badge}${rm}</span>
+    </div>`;
+  }).join('');
+
+  col.innerHTML=`<div class="card-lg ${l.theme}">
+    <div class="l-header">
+      <span class="ln" contenteditable="true" data-ph="Lane name"
+        onblur="lane('${id}').label=this.textContent.trim()||lane('${id}').label">${esc(l.label)}</span>
+      <span class="ls" id="sub-${id}">${sub}</span>
+      <div class="theme-row edit-only">${dots}</div>
+    </div>
+    <div class="l-body" id="body-${id}">
+      ${slots}
+      <div class="add-row edit-only">
+        <button class="add-btn" onclick="addPlayer('${id}')">+ Add Player</button>
+      </div>
+    </div>
+  </div>`;
+
+  updateTotals();
+}
+
+function addPlayer(id){
+  saveState(id);
+  lane(id).players.push('');
+  renderLane(id);
+  syncRoles(id);
+  setTimeout(()=>{
+    const els=document.querySelectorAll(`#body-${id} [data-pname]`);
+    if(els.length) els[els.length-1].focus();
+  },40);
+}
+
+function removePlayer(id,i){
+  saveState(id);
+  const l=lane(id);
+  if(l.players.length<=1)return;
+  l.players.splice(i,1);
+  renderLane(id);
+  syncRoles(id);
+}
+
+function toggleSS(){
+  const on=document.body.classList.toggle('screenshot');
+  const btn=document.getElementById('ss-btn');
+  btn.textContent=on?'Back to Edit Mode':'Hide Controls for Screenshot';
+  btn.style.position=on?'fixed':'';
+  btn.style.bottom=on?'16px':'';
+  btn.style.right=on?'16px':'';
+  btn.style.zIndex=on?'9999':'';
+  btn.style.opacity=on?'0.7':'';
+}
+
+function saveRules(){
+  document.querySelectorAll('[data-ridx]').forEach(el=>{
+    const i=parseInt(el.dataset.ridx);
+    if(RULES[i]) RULES[i].html=el.innerHTML;
+  });
+}
+
+function renderRules(){
+  const grid=document.getElementById('rules-grid');
+  grid.innerHTML=RULES.map((r,i)=>`
+    <div style="display:flex;align-items:flex-start;gap:4px;padding:5px 0;border-bottom:0.5px solid #F3F4F6;">
+      <span class="rule${r.alert?' alert':''}" style="flex:1;border-bottom:none;padding:0"
+        contenteditable="true" data-ridx="${i}"
+        oninput="RULES[${i}].html=this.innerHTML">${r.html}</span>
+      <button class="rm-btn edit-only" onclick="removeRule(${i})" title="Remove rule">×</button>
+    </div>`).join('');
+}
+
+function addRule(){
+  saveRules();
+  RULES.push({html:'',alert:false});
+  renderRules();
+  setTimeout(()=>{
+    const els=document.querySelectorAll('[data-ridx]');
+    if(els.length) els[els.length-1].focus();
+  },40);
+}
+
+function removeRule(i){
+  saveRules();
+  if(RULES.length<=1) return;
+  RULES.splice(i,1);
+  renderRules();
+}
+
+function exportPlan(){
+  LANES.forEach(l=>saveState(l.id));
+  saveRules();
+
+  let html=document.documentElement.outerHTML;
+
+  const lanesStr=LANES.map(l=>
+    `  { id:${JSON.stringify(l.id)}, theme:${JSON.stringify(l.theme)}, label:${JSON.stringify(l.label)}, players:${JSON.stringify(l.players)} }`
+  ).join(',\n');
+  const newLanesDef=`const LANES = [ /*__LANES_START__*/\n${lanesStr}\n];`;
+  html=html.replace(/const LANES = \[ \/\*__LANES_START__\*\/[\s\S]*?\];/,newLanesDef);
+
+  const rulesStr=RULES.map(r=>
+    `  { html:${JSON.stringify(r.html)}, alert:${r.alert} }`
+  ).join(',\n');
+  const newRulesDef=`let RULES = [ /*__RULES_START__*/\n${rulesStr}\n]; /*__RULES_END__*/`;
+  html=html.replace(/let RULES = \[ \/\*__RULES_START__\*\/[\s\S]*?\/\*__RULES_END__\*\//,newRulesDef);
+
+  const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='canyon_clash_filled.html';
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast('Exported! Share the downloaded file in Discord.');
+}
+
+function showToast(msg){
+  const t=document.createElement('div');
+  t.textContent=msg;
+  t.style.cssText='position:fixed;bottom:60px;right:16px;background:#111827;color:#fff;padding:9px 14px;border-radius:8px;font-size:12px;font-weight:600;z-index:99999;opacity:1;transition:opacity .6s;max-width:260px;line-height:1.4';
+  document.body.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),600);},3000);
+}
+
+LANES.forEach(l=>renderLane(l.id));
+LANES.forEach(l=>syncRoles(l.id));
+renderRules();
+</script>
+
+
+</body></html>
